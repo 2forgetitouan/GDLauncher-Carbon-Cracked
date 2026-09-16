@@ -468,8 +468,12 @@ describe("verifyLibrariesPresent", () => {
 
     expect(result.ok).toBe(false)
     expect(result.problems).toHaveLength(2)
-    expect(result.problems.some((p) => p.includes(missingA))).toBe(true)
-    expect(result.problems.some((p) => p.includes(missingB))).toBe(true)
+    expect(
+      result.problems.some((p) => p.includes(path.normalize(missingA)))
+    ).toBe(true)
+    expect(
+      result.problems.some((p) => p.includes(path.normalize(missingB)))
+    ).toBe(true)
   })
 })
 
@@ -503,8 +507,7 @@ describe("verifyLibrariesAbsent", () => {
     const goneA = "org/ow2/asm/asm/9.3/asm-9.3.jar"
     const stillThereA =
       "net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-client.jar"
-    const stillThereB =
-      "net/minecraft/client/1.20.1/client-1.20.1-srg.jar"
+    const stillThereB = "net/minecraft/client/1.20.1/client-1.20.1-srg.jar"
 
     await writeLibrary(runtimePath, stillThereA, Buffer.from("jar bytes"))
     await writeLibrary(runtimePath, stillThereB, Buffer.from("jar bytes"))

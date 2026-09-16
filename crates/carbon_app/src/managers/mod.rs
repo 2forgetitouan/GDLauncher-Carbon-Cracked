@@ -216,44 +216,6 @@ mod app {
 
             let _app = app.clone();
             tokio::spawn(async move {
-                let bg_total = std::time::Instant::now();
-
-                let t = std::time::Instant::now();
-                _app.clone()
-                    .instance_manager()
-                    .launch_background_tasks()
-                    .await;
-                debug!(
-                    "[startup-timing] instance_manager.launch_background_tasks (scan_instances) completed in {:.2}s",
-                    t.elapsed().as_secs_f64()
-                );
-
-                let t = std::time::Instant::now();
-                _app.clone()
-                    .server_manager()
-                    .launch_background_tasks()
-                    .await;
-                debug!(
-                    "[startup-timing] server_manager.launch_background_tasks completed in {:.2}s",
-                    t.elapsed().as_secs_f64()
-                );
-
-                let t = std::time::Instant::now();
-                _app.meta_cache_manager().launch_background_tasks().await;
-                debug!(
-                    "[startup-timing] meta_cache_manager.launch_background_tasks completed in {:.2}s",
-                    t.elapsed().as_secs_f64()
-                );
-
-                debug!(
-                    "[startup-timing] all background tasks ready, emitting LaunchBackgroundTasks status (took {:.2}s)",
-                    bg_total.elapsed().as_secs_f64()
-                );
-                update_core_module_status(CoreModuleStatus::LaunchBackgroundTasks);
-            });
-
-            let _app = app.clone();
-            tokio::spawn(async move {
                 let settings = _app.settings_manager().get_settings().await;
 
                 match settings {
@@ -307,6 +269,51 @@ mod app {
             });
 
             app
+        }
+
+        /// Brings up instance scanning, server scanning and metadata caching.
+        ///
+        /// Deliberately not called from [`AppInner::new`]: `scan_instances`
+        /// reconciles every on-disk pidfile and removes the ones whose pid is
+        /// not a live JVM, so a constructor that started it would be mutating
+        /// on-disk state behind the caller's back with no way to wait for it.
+        /// The caller decides — the app spawns this so a full scan does not
+        /// hold up startup, tests await it so it is finished before they run.
+        pub(crate) async fn start_background_tasks(self: &Arc<Self>) {
+            let bg_total = std::time::Instant::now();
+
+            let t = std::time::Instant::now();
+            self.clone()
+                .instance_manager()
+                .launch_background_tasks()
+                .await;
+            debug!(
+                "[startup-timing] instance_manager.launch_background_tasks (scan_instances) completed in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+
+            let t = std::time::Instant::now();
+            self.clone()
+                .server_manager()
+                .launch_background_tasks()
+                .await;
+            debug!(
+                "[startup-timing] server_manager.launch_background_tasks completed in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+
+            let t = std::time::Instant::now();
+            self.meta_cache_manager().launch_background_tasks().await;
+            debug!(
+                "[startup-timing] meta_cache_manager.launch_background_tasks completed in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+
+            debug!(
+                "[startup-timing] all background tasks ready, emitting LaunchBackgroundTasks status (took {:.2}s)",
+                bg_total.elapsed().as_secs_f64()
+            );
+            update_core_module_status(CoreModuleStatus::LaunchBackgroundTasks);
         }
 
         manager_getter!(metrics_manager: MetricsManager);

@@ -88,7 +88,7 @@ pub fn get_client(gdl_base_api: String) -> reqwest_middleware::ClientBuilder {
                     }
                     _ => None,
                 };
-                if declared_wait.is_some_and(|wait| wait > MAX_HONOURED_RATE_LIMIT_WAIT) {
+                if exceeds_honoured_rate_limit_wait(declared_wait) {
                     tracing::warn!(
                         "rate limited by {} for longer than we will wait; returning the response",
                         req.url()
@@ -319,7 +319,7 @@ mod test {
 
     #[tokio::test]
     async fn slow_stream_is_not_capped() {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         const CHUNK: &[u8] = b"0123456789";
@@ -332,6 +332,17 @@ mod test {
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept failed");
+            // Drain the request before responding. Nothing here needs its
+            // contents, but leaving it unread means this socket still holds
+            // received data when the task ends and drops it, and closing a
+            // socket with unread data in its receive buffer sends an RST
+            // rather than a FIN. That RST discards what the peer has not yet
+            // consumed, so the client surfaces `ConnectionReset` partway
+            // through decoding instead of the complete body asserted below —
+            // deterministically so on Windows, where the reset wins the race
+            // against the last chunks every time.
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
             socket
                 .write_all(
                     format!(
@@ -342,8 +353,13 @@ mod test {
                 )
                 .await
                 .expect("failed to write headers");
-            // A chunk every 100ms for 3s: no single gap trips a 500ms read
-            // budget, even though the transfer as a whole vastly exceeds it.
+            // A chunk every 100ms for 3s. What is under test is that the
+            // budget applies per read gap and not to the transfer as a whole,
+            // so the total has to exceed it while no single gap comes close.
+            // The gap budget below is 2s against a 100ms cadence: a loaded CI
+            // box has to stall a sleep by 20x before this reports a cap that
+            // did not happen. At 500ms it only took a 5x stall, which a
+            // Windows runner under a full parallel suite does hit.
             for _ in 0..CHUNK_COUNT {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 socket
@@ -354,8 +370,8 @@ mod test {
         });
 
         let client = super::shared_client_builder(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
         )
         .build()
         .expect("failed to build client");
@@ -374,9 +390,16 @@ mod test {
 }
 
 /// How long a server-declared rate-limit window may be before the request is
-/// handed back instead of waited out. Beyond this, holding the caller is worse
-/// than surfacing the 429.
-const MAX_HONOURED_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// handed back instead of waited out. Both platforms limit per minute, so a
+/// genuine window never exceeds ~60s; beyond that, holding the caller is
+/// worse than surfacing the 429.
+const MAX_HONOURED_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(70);
+
+/// Separate from the middleware so the policy can be asserted without
+/// sleeping through a real window.
+fn exceeds_honoured_rate_limit_wait(declared_wait: Option<std::time::Duration>) -> bool {
+    declared_wait.is_some_and(|wait| wait > MAX_HONOURED_RATE_LIMIT_WAIT)
+}
 
 /// The wait a 429 response asks for, from `Retry-After` (delta-seconds) or
 /// Modrinth's `X-Ratelimit-Reset` (seconds until the window rolls over).
@@ -540,6 +563,28 @@ mod tests {
             wait <= Duration::from_secs(5),
             "expected a delta close to 5s, got {wait:?}"
         );
+    }
+
+    #[test]
+    fn a_window_length_rate_limit_is_waited_out_not_surfaced() {
+        assert!(!exceeds_honoured_rate_limit_wait(Some(
+            Duration::from_secs(45)
+        )));
+        assert!(!exceeds_honoured_rate_limit_wait(Some(
+            Duration::from_secs(60)
+        )));
+    }
+
+    #[test]
+    fn a_wait_beyond_a_full_window_is_still_surfaced() {
+        assert!(exceeds_honoured_rate_limit_wait(Some(Duration::from_secs(
+            600
+        ))));
+    }
+
+    #[test]
+    fn no_declared_wait_is_not_treated_as_too_long() {
+        assert!(!exceeds_honoured_rate_limit_wait(None));
     }
 
     #[test]

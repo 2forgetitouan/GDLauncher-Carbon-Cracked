@@ -58,7 +58,11 @@ import {
   LAUNCH_TIMEOUT
 } from "./helpers/instances.js"
 import { readInstanceByName } from "./helpers/versionCache.js"
-import { isPidAlive, pidsMatching } from "./helpers/processes.js"
+import {
+  isPidAlive,
+  killProcessTree,
+  pidBelongsToRun
+} from "./helpers/processes.js"
 
 const INSTANCE_NAME = "gdl-e2e-survives-close"
 const MC_VERSION = "1.20.1"
@@ -79,12 +83,20 @@ const PID_FILE_NAME = ".gdl_instance.pid"
  * exactly the window in which one exists. A liveness probe alone could
  * therefore read a just-killed game as a surviving one, which is the single
  * way this spec could pass while the behaviour it guards is broken. A zombie
- * has no `/proc/<pid>/cmdline` left to match, so requiring the pid to still be
- * found by its own managed-JRE path rules that out — the same attribution
+ * has no `/proc/<pid>/cmdline` left to match, so requiring the pid to still
+ * carry a command line rules that out — the same attribution
  * `killGameProcesses` uses to decide what it may kill.
+ *
+ * Matched on the runtime path rather than on `managed_javas`: the launcher
+ * only downloads a managed JRE when it cannot find a system one, and a CI
+ * runner ships several (the GitHub images carry Temurin 8 through 25), so the
+ * game launches as `/usr/lib/jvm/.../bin/java` and no `managed_javas` path
+ * ever exists. The runtime path is in the game's arguments either way, and is
+ * per-run here, so it identifies the process without assuming which JRE ran
+ * it.
  */
 function gameIsRunning(runtimePath: string, pid: number): boolean {
-  return pidsMatching(path.join(runtimePath, "managed_javas")).includes(pid)
+  return pidBelongsToRun(pid, runtimePath)
 }
 
 test.describe("running game outlives the launcher", () => {
@@ -193,7 +205,18 @@ test.describe("running game outlives the launcher", () => {
       ).toBe(true)
     } finally {
       await attachCoreLogOnFailure(testInfo, harness.runtimePath)
-      if (current) await current.app.close()
+      if (current) {
+        // `app.close()` never returns while the app still owns a running
+        // game, and bounding it alone leaves a launcher the next spec trips on.
+        const electronPid = current.app.process().pid
+        await Promise.race([
+          current.app.close().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 15_000))
+        ])
+        if (electronPid !== undefined && isPidAlive(electronPid)) {
+          killProcessTree(electronPid)
+        }
+      }
       // Kill the game explicitly: it now survives the launcher by design, so
       // nothing else in teardown would end it. `stopHarness` sweeps the same
       // process as a backstop, but this runs first and by pid, so a failure

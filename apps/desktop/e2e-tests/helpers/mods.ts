@@ -471,6 +471,9 @@ export async function searchForMod(
  * sites is safe, and not the "constructing a filename" anti-pattern this
  * suite avoids) from the current search results.
  */
+/** Covers the row's 100ms hover transition, with room for a slow frame. */
+const HOVER_SETTLE_MS = 300
+
 export async function openAddonPage(
   page: Page,
   identifier: string
@@ -479,6 +482,14 @@ export async function openAddonPage(
     `${byTestId(TEST_IDS.searchResultRow)}[data-project-id="${identifier}"]`
   )
   await expect(row).toBeVisible({ timeout: SEARCH_RESULTS_TIMEOUT })
+  // Hovered and settled before the click. The row lifts on hover
+  // (`hover:scale-[1.02]` over `duration-100`, `Search/ListItem.tsx`) inside a
+  // virtualised list, so a click delivered in the same breath as the hover
+  // arrives while the row is still moving and lands somewhere with no handler:
+  // the route never changes and the addon page never opens. A real user has
+  // long since settled the hover by the time they click.
+  await row.hover()
+  await page.waitForTimeout(HOVER_SETTLE_MS)
   await row.click()
   await expect(
     page.locator(byTestId(TEST_IDS.addonInstallButton))
@@ -984,62 +995,117 @@ export async function settleOnScopedResponses(
  * (`@tanstack/solid-virtual`) and only mounts rows near the viewport.
  */
 export async function openAddonVersions(
-  page: Page
+  page: Page,
+  opts: { gameVersion?: string } = {}
 ): Promise<AddonVersionSummary[]> {
-  const queryName = "modplatforms.modrinth.getProjectVersions"
-  // Present on the URL of the scoped request only — confirmed live.
-  const scopedMarker = "game_version"
+  const rows = page.locator(byTestId(TEST_IDS.addonVersionRow))
 
-  const scopedResponses = await settleOnScopedResponses(
-    page,
-    (r) => r.url().includes(queryName) && r.url().includes(scopedMarker),
-    {
-      timeout: VERSIONS_RESPONSE_TIMEOUT,
-      run: async () => {
-        await page.getByRole("tab", { name: "Versions" }).click()
+  await page.getByRole("tab", { name: "Versions" }).click()
+  await expect(rows.first(), {
+    message: `openAddonVersions: no "${TEST_IDS.addonVersionRow}" row ever mounted`
+  }).toBeVisible({ timeout: VERSIONS_RESPONSE_TIMEOUT })
 
-        await expect(page.locator(byTestId(TEST_IDS.addonVersionRow)).first(), {
-          message:
-            "openAddonVersions: no " +
-            `"${TEST_IDS.addonVersionRow}" row ever mounted`
-        }).toBeVisible({ timeout: VERSIONS_RESPONSE_TIMEOUT })
-      }
+  const readRows = () =>
+    rows.evaluateAll((nodes) =>
+      nodes.map((n) => ({
+        fileId: n.getAttribute("data-file-id") ?? "",
+        datePublished: n.getAttribute("data-date-published") ?? "",
+        gameVersions: (n.getAttribute("data-game-versions") ?? "")
+          .split(",")
+          .filter(Boolean)
+      }))
+    )
+
+  // Let the list stop changing before reading it. A first render can be
+  // replaced as the scoped answer arrives, and a caller handed rows from the
+  // outgoing list clicks a button that is detached by the time the click
+  // lands — which surfaces as `<html> intercepts pointer events`, not as
+  // anything naming this function. The old network-settle did this as a side
+  // effect of waiting for responses to stop; this waits on the rows
+  // themselves, so it holds when a warm cache means no response ever arrives.
+  const ROWS_SETTLE_MS = 1_000
+  const deadline = Date.now() + VERSIONS_RESPONSE_TIMEOUT
+  let rendered = await readRows()
+  let signature = JSON.stringify(rendered.map((v) => v.fileId))
+  let stableSince = Date.now()
+
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(250)
+    const next = await readRows()
+    const nextSignature = JSON.stringify(next.map((v) => v.fileId))
+
+    if (nextSignature !== signature) {
+      signature = nextSignature
+      rendered = next
+      stableSince = Date.now()
+      continue
     }
-  )
 
-  if (scopedResponses.length === 0) {
+    rendered = next
+    if (Date.now() - stableSince >= ROWS_SETTLE_MS) break
+  }
+
+  if (rendered.length === 0) {
     throw new Error(
-      `openAddonVersions: no ${queryName} request scoped to the instance's ` +
-        `own Minecraft version/loader (a "${scopedMarker}" URL param) was ` +
-        `observed within ${VERSIONS_RESPONSE_TIMEOUT}ms`
+      "openAddonVersions: the Versions tab rendered no version rows at all"
     )
   }
 
-  // Last, not first: `InfiniteScrollVersionsQueryWrapper`'s scoping effect
-  // has been observed to fire its scoped request twice in a row — harmless
-  // (same params, same result), but the last
-  // one is closest to whatever the DOM ends up rendering.
-  const response = scopedResponses[scopedResponses.length - 1]
-  const body = (await response.json()) as RspcEnvelope
-  if (body.result?.type === "error") {
+  // The scoping guard, asserted on what is displayed. Unscoped, this list is
+  // every version the project ever published — 1165 for Fabric API against an
+  // instance that matches 27 — so a row offering a build for some other
+  // Minecraft version means the list on screen is not this instance's, however
+  // it got there. Checking the rendered rows catches that whether it came from
+  // an unscoped request or from a cache entry belonging to another instance,
+  // which watching the wire could not.
+  const declared = rendered.filter((v) => v.gameVersions.length > 0)
+
+  if (opts.gameVersion) {
+    const foreign = declared.filter(
+      (v) => !v.gameVersions.includes(opts.gameVersion!)
+    )
+    if (foreign.length > 0) {
+      throw new Error(
+        `openAddonVersions: ${foreign.length} of ${rendered.length} rendered ` +
+          `version rows are not scoped to the instance's Minecraft version ` +
+          `(${opts.gameVersion}) — the list on screen belongs to a different ` +
+          `scope: ${JSON.stringify(foreign.slice(0, 3))}`
+      )
+    }
+  } else if (declared.length > 1) {
+    // Without the instance's version to compare against, the scoped list is
+    // still recognisable by what it has in common: every row in it builds for
+    // the instance's Minecraft version, so at least one version is shared by
+    // all of them. An unscoped list is the project's entire history — 1165
+    // versions for Fabric API spanning years of Minecraft releases — and has
+    // no version common to every row.
+    const shared = declared
+      .map((v) => v.gameVersions)
+      .reduce((acc, next) => acc.filter((g) => next.includes(g)))
+
+    if (shared.length === 0) {
+      const spread = [...new Set(declared.flatMap((v) => v.gameVersions))]
+      throw new Error(
+        `openAddonVersions: the ${rendered.length} rendered version rows ` +
+          "share no common Minecraft version, so the list on screen is not " +
+          "scoped to one instance — it spans " +
+          `${spread.length} versions: ${JSON.stringify(spread.slice(0, 8))}`
+      )
+    }
+  }
+
+  const missingDate = rendered.filter((v) => !v.datePublished)
+  if (missingDate.length > 0) {
     throw new Error(
-      `openAddonVersions: ${queryName} returned an rspc error: ` +
-        JSON.stringify(body.result.data)
+      `openAddonVersions: ${missingDate.length} rendered row(s) carry no ` +
+        "data-date-published, so version ordering cannot be established"
     )
   }
 
-  const versions: AddonVersionSummary[] = (
-    body.result?.data as { id: string; date_published: string }[]
-  ).map((v) => ({ fileId: v.id, datePublished: v.date_published }))
-
-  if (versions.length === 0) {
-    throw new Error(
-      `openAddonVersions: ${queryName} answered with zero versions scoped ` +
-        "to the instance's own Minecraft version/loader"
-    )
-  }
-
-  return versions
+  return rendered.map((v) => ({
+    fileId: v.fileId,
+    datePublished: v.datePublished
+  }))
 }
 
 /**

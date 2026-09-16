@@ -114,20 +114,25 @@ export async function launchApp(opts: LaunchOptions): Promise<{
   const binaryPath = getBinaryPath()
   const args = ["--gdl_allow_multiple_instances", "--gdl_disable_sentry"]
 
+  // Passed by environment, not argv: ow-electron 39.8.11 on Windows exits
+  // before Node initialises when two argv tokens contain `://`, which killed
+  // every launch here. Read by `main/index.ts`'s `argumentOrE2EEnv`. The
+  // entitlement key stays an argument — it is a path, not a URL.
+  const urlEnv: Record<string, string> = {}
   if (opts.baseApi) {
-    args.push("--gdl_override_base_api", opts.baseApi)
+    urlEnv.GDL_OVERRIDE_BASE_API = opts.baseApi
   }
 
   if (opts.e2eAuthBase) {
-    args.push("--gdl_e2e_auth_base", opts.e2eAuthBase)
+    urlEnv.GDL_E2E_AUTH_BASE = opts.e2eAuthBase
+  }
+
+  if (opts.e2eUpdateFeed) {
+    urlEnv.GDL_E2E_UPDATE_FEED = opts.e2eUpdateFeed
   }
 
   if (opts.e2eEntitlementKey) {
     args.push("--gdl_e2e_entitlement_key", opts.e2eEntitlementKey)
-  }
-
-  if (opts.e2eUpdateFeed) {
-    args.push("--gdl_e2e_update_feed", opts.e2eUpdateFeed)
   }
 
   console.log("Launching Electron from:", binaryPath)
@@ -147,7 +152,12 @@ export async function launchApp(opts: LaunchOptions): Promise<{
       executablePath: binaryPath,
       env: {
         ...process.env,
-        GDL_RUNTIME_PATH: opts.runtimePath
+        GDL_RUNTIME_PATH: opts.runtimePath,
+        ...urlEnv,
+        // A fresh runtime dir derives its heap from total RAM, which on a
+        // 7 GB CI runner exceeds what is available by launch time. Pin one
+        // that fits; overridable for roomier runners.
+        GDL_E2E_DEFAULT_XMX_MB: process.env.GDL_E2E_DEFAULT_XMX_MB ?? "1024"
       } as Record<string, string>
     })
     .catch((error) => {
@@ -179,6 +189,16 @@ export async function launchApp(opts: LaunchOptions): Promise<{
 
   const page = await app.firstWindow()
   page.on("console", (msg) => console.log(msg.text()))
+
+  // A failing request otherwise reaches the log as a bare "Failed to load
+  // resource: 500" with no URL, which names nothing.
+  page.on("response", (response) => {
+    if (response.status() >= 400) {
+      console.log(
+        `[http ${response.status()}] ${response.request().method()} ${response.url()}`
+      )
+    }
+  })
 
   const pageErrors: Error[] = []
   page.on("pageerror", (error) => {
@@ -256,13 +276,42 @@ export async function waitForPidExit(
 
     if (Date.now() >= deadline) {
       throw new Error(
-        `relaunchApp: core process (pid ${pid}) did not exit within ${timeoutMs}ms of app.close(). ` +
+        `core process (pid ${pid}) did not exit within ${timeoutMs}ms of app.close(). ` +
           "Relaunching against the same runtime path now would race the old process's SQLite handles " +
           "and surface as a locked-database failure that looks like corruption but isn't."
       )
     }
 
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+  }
+}
+
+/**
+ * Closes `app` and returns only once the core module it spawned has actually
+ * exited.
+ *
+ * `app.close()` resolves when Electron is gone, but the core is a separate
+ * child process that outlives it — briefly, and sometimes for well over ten
+ * seconds — holding SQLite handles under the runtime path. Deleting that path
+ * before the core lets go fails with EPERM out of teardown, which reads as a
+ * test failure long after every assertion has passed.
+ *
+ * Teardown-only, so a core that never exits is reported rather than thrown:
+ * masking a real test failure behind a cleanup error is worse than leaking a
+ * directory the next run's sweep will collect.
+ */
+export async function closeAppAndCore(
+  app: ElectronApplication,
+  { timeoutMs = 30_000 } = {}
+): Promise<void> {
+  const corePid = await getCoreProcessId(app).catch(() => null)
+  await app.close().catch(() => {})
+  if (corePid === null) return
+
+  try {
+    await waitForPidExit(corePid, { timeoutMs })
+  } catch (error) {
+    console.error("closeAppAndCore:", error)
   }
 }
 
