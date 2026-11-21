@@ -1,6 +1,7 @@
 use super::{
     GET_IMPORT_SCAN_STATUS, ImportScanStatus, ImportableInstance, ImporterState, InstanceImporter,
     InternalImportEntry, InvalidImportEntry,
+    common::{ImportedSettings, apply_imported_settings, dedup_paths, read_json_value},
 };
 use crate::api::translation::Translation;
 use crate::domain::instance::info::{CurseforgeModpack, GameVersion, Modpack};
@@ -14,6 +15,57 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, trace};
+
+/// The app writes a relocated modding folder into its own `settings.json`, but it
+/// is closed source and the key is undocumented, so every absolute path in that
+/// file is tried and only one that really holds an `Instances` directory is
+/// accepted. A wrong guess therefore costs nothing and falls back to the default.
+async fn instances_dir_from_settings() -> Option<PathBuf> {
+    let basedirs = directories::BaseDirs::new()?;
+    let settings_files = dedup_paths(vec![
+        basedirs.data_dir().join("CurseForge").join("settings.json"),
+        basedirs
+            .data_local_dir()
+            .join("CurseForge")
+            .join("settings.json"),
+    ]);
+
+    for file in settings_files {
+        let Some(json) = read_json_value(&file).await else {
+            continue;
+        };
+        if let Some(dir) = find_instances_dir(&json) {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
+/// `<modding folder>/Instances` is the layout the app uses, so both the folder
+/// itself and its parent are worth recognising.
+fn find_instances_dir(value: &serde_json::Value) -> Option<PathBuf> {
+    match value {
+        serde_json::Value::String(s) => {
+            let path = PathBuf::from(s.trim());
+            if !path.is_absolute() {
+                return None;
+            }
+            if path.file_name().is_some_and(|n| n == "Instances") && path.is_dir() {
+                return Some(path);
+            }
+            let nested = path.join("minecraft").join("Instances");
+            if nested.is_dir() {
+                return Some(nested);
+            }
+            let direct = path.join("Instances");
+            direct.is_dir().then_some(direct)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(find_instances_dir),
+        serde_json::Value::Object(map) => map.values().find_map(find_instances_dir),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Importable {
@@ -37,6 +89,26 @@ struct CfMetadata {
     last_played: Option<String>,
     is_unlocked: bool,
     profile_image_path: Option<String>,
+    /// Memory in MB, meaningful when `isMemoryOverride` is set.
+    #[serde(default)]
+    allocated_memory: Option<u32>,
+    #[serde(default)]
+    is_memory_override: Option<bool>,
+    #[serde(default)]
+    java_args_override: Option<String>,
+}
+
+impl CfMetadata {
+    fn settings(&self) -> ImportedSettings {
+        let mut settings = ImportedSettings::default();
+        if self.is_memory_override == Some(true) {
+            settings.memory_max_mb = self.allocated_memory.filter(|m| *m > 0);
+        }
+        if let Some(args) = self.java_args_override.as_deref() {
+            settings.absorb_jvm_args(args);
+        }
+        settings
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +144,10 @@ impl CurseforgeImporter {
     }
 
     pub async fn get_default_scan_path() -> anyhow::Result<PathBuf> {
+        if let Some(relocated) = instances_dir_from_settings().await {
+            return Ok(relocated);
+        }
+
         let userdirs = directories::UserDirs::new().ok_or(anyhow!("Cannot determine user directories. Please manually select your CurseForge instances folder."))?;
 
         #[cfg(not(target_os = "windows"))]
@@ -243,7 +319,7 @@ impl InstanceImporter for CurseforgeImporter {
                                 }
                             }
 
-                            dbg!(name).to_string()
+                            name.to_string()
                         },
                         primary: true,
                     })
@@ -282,9 +358,87 @@ impl InstanceImporter for CurseforgeImporter {
             )
             .await?;
 
+        apply_imported_settings(app, id, &instance.meta.settings()).await;
+
         app.instance_manager()
             .prepare_game(id, None, None, false)
             .await
             .map(|r| r.1)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn instance_overrides_are_read_from_minecraftinstance_json() {
+        let meta: CfMetadata = serde_json::from_value(serde_json::json!({
+            "name": "ATM9",
+            "projectID": 715572,
+            "fileID": 5142600,
+            "gameVersion": "1.20.1",
+            "isUnlocked": false,
+            "allocatedMemory": 8192,
+            "isMemoryOverride": true,
+            "javaArgsOverride": "-XX:+UseG1GC -Xms2G"
+        }))
+        .unwrap();
+        let settings = meta.settings();
+        assert_eq!(settings.memory(), Some((2048, 8192)));
+        assert_eq!(settings.extra_java_args.as_deref(), Some("-XX:+UseG1GC"));
+
+        // Without the override flag the memory value is the app's global, not the instance's.
+        let meta: CfMetadata = serde_json::from_value(serde_json::json!({
+            "name": "Old",
+            "projectID": 1,
+            "fileID": 2,
+            "gameVersion": "1.12.2",
+            "isUnlocked": true,
+            "allocatedMemory": 4096,
+            "isMemoryOverride": false,
+            "javaArgsOverride": null
+        }))
+        .unwrap();
+        assert_eq!(meta.settings(), ImportedSettings::default());
+
+        let meta: CfMetadata = serde_json::from_value(serde_json::json!({
+            "name": "Older",
+            "projectID": 1,
+            "fileID": 2,
+            "gameVersion": "1.7.10",
+            "isUnlocked": true
+        }))
+        .unwrap();
+        assert_eq!(meta.settings(), ImportedSettings::default());
+    }
+
+    #[test]
+    fn relocated_modding_folder_is_recognised_only_when_it_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modding = tmp.path().join("D_drive").join("curseforge");
+        std::fs::create_dir_all(modding.join("minecraft").join("Instances")).unwrap();
+
+        // The app records the modding folder; instances sit under minecraft/Instances.
+        let json =
+            serde_json::json!({ "minecraft": { "moddingFolder": modding.to_string_lossy() } });
+        assert_eq!(
+            find_instances_dir(&json),
+            Some(modding.join("minecraft").join("Instances"))
+        );
+
+        // The instances folder named outright is accepted too.
+        let direct = serde_json::json!([modding
+            .join("minecraft")
+            .join("Instances")
+            .to_string_lossy()]);
+        assert_eq!(
+            find_instances_dir(&direct),
+            Some(modding.join("minecraft").join("Instances"))
+        );
+
+        // A path that does not exist is ignored, so a wrong guess costs nothing.
+        let missing = serde_json::json!({ "a": "/no/such/place", "b": "relative/path" });
+        assert_eq!(find_instances_dir(&missing), None);
     }
 }
