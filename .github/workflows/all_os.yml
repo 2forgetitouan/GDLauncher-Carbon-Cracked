@@ -11,7 +11,7 @@ jobs:
     defaults:
       run:
         working-directory: ./GDL
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 160
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -104,7 +104,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gdlauncher-macos
-          path: ./GDL/apps/desktop/release/*.dmg
+          path: ./GDL/apps/desktop/release/*.zip
+          if-no-files-found: error
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
@@ -223,7 +224,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gdlauncher-linux
-          path: ./GDL/apps/desktop/release/*.AppImage
+          path: ./GDL/apps/desktop/release/*.zip
+          if-no-files-found: error
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
@@ -345,7 +347,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gdlauncher-windows
-          path: ./GDL/apps/desktop/release/*.exe
+          path: ./GDL/apps/desktop/release/*.zip
+          if-no-files-found: error
       - name: Upload main.log for debugging
         uses: actions/upload-artifact@v4
         if: always()
